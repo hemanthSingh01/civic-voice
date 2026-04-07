@@ -1,0 +1,172 @@
+import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import prisma from "../utils/prisma.js";
+import { AuditAction, logAuditEvent } from "../utils/audit.js";
+
+const statusSchema = z.object({
+  status: z.enum(["REPORTED", "IN_PROGRESS", "RESOLVED"]),
+});
+
+const resolveSchema = z.object({
+  resolutionProofImages: z.array(z.string().url()).default([]),
+});
+
+function normalizeLocationValue(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function getAdminLocationFilter(admin) {
+  if (!admin.country || !admin.state || !admin.district || !admin.cityVillage) {
+    return null;
+  }
+
+  // Use case-insensitive matching for locations
+  return {
+    country: { equals: normalizeLocationValue(admin.country), mode: Prisma.QueryMode.insensitive },
+    state: { equals: normalizeLocationValue(admin.state), mode: Prisma.QueryMode.insensitive },
+    district: { equals: normalizeLocationValue(admin.district), mode: Prisma.QueryMode.insensitive },
+    cityVillage: { equals: normalizeLocationValue(admin.cityVillage), mode: Prisma.QueryMode.insensitive },
+  };
+}
+
+async function getIssueForAdminLocation(problemId, admin) {
+  const locationFilter = getAdminLocationFilter(admin);
+
+  if (!locationFilter) {
+    return null;
+  }
+
+  return prisma.problem.findFirst({
+    where: {
+      id: problemId,
+      ...locationFilter,
+    },
+  });
+}
+
+export async function listModerationQueue(req, res) {
+  const admin = req.user;
+  const locationFilter = getAdminLocationFilter(admin);
+
+  if (!locationFilter) {
+    return res.status(400).json({ message: "Set your full admin location before opening moderation" });
+  }
+
+  // Debug: log what location we're filtering by
+  console.log("Admin location filter:", {
+    country: locationFilter.country.equals,
+    state: locationFilter.state.equals,
+    district: locationFilter.district.equals,
+    cityVillage: locationFilter.cityVillage.equals,
+  });
+
+  // First, get ALL issues in this location to debug
+  const allIssuesInLocation = await prisma.problem.findMany({
+    where: locationFilter,
+    select: {
+      id: true,
+      title: true,
+      country: true,
+      state: true,
+      district: true,
+      cityVillage: true,
+      status: true,
+    },
+  });
+
+  console.log(`Found ${allIssuesInLocation.length} total issues in admin location:`, allIssuesInLocation.map(i => ({ 
+    title: i.title, 
+    location: `${i.cityVillage}, ${i.district}, ${i.state}`,
+    status: i.status
+  })));
+
+  // Show ALL issues in this location (both unresolved and resolved) for admin moderation
+  const posts = await prisma.problem.findMany({
+    where: locationFilter,
+    include: {
+      _count: { select: { reports: true, upvotes: true, comments: true } },
+      reports: {
+        take: 3,
+        orderBy: { createdAt: "desc" },
+        select: { id: true, reason: true, createdAt: true },
+      },
+    },
+    // Sort by: issues with reports first, then by most recent
+    orderBy: [{ reports: { _count: "desc" } }, { createdAt: "desc" }],
+  });
+
+  console.log(`Returning ${posts.length} issues for admin ${admin.mobile}`);
+
+  return res.json(posts);
+}
+
+export async function updateIssueStatus(req, res) {
+  const payload = statusSchema.parse(req.body);
+  const { id } = req.params;
+
+  const issue = await getIssueForAdminLocation(id, req.user);
+
+  if (!issue) {
+    return res.status(404).json({ message: "Issue not found in your assigned location" });
+  }
+
+  const updated = await prisma.problem.update({
+    where: { id },
+    data: { status: payload.status },
+  });
+
+  await logAuditEvent({
+    actor: req.user,
+    action: AuditAction.ISSUE_STATUS_UPDATED,
+    entityType: "PROBLEM",
+    entityId: updated.id,
+    summary: `${req.user.mobile || "Unknown admin"} changed issue ${updated.id} status to ${updated.status}`,
+  });
+
+  return res.json(updated);
+}
+
+export async function resolveIssue(req, res) {
+  const payload = resolveSchema.parse(req.body);
+  const { id } = req.params;
+
+  const issue = await getIssueForAdminLocation(id, req.user);
+
+  if (!issue) {
+    return res.status(404).json({ message: "Issue not found in your assigned location" });
+  }
+
+  // REQUIRED: At least one proof image must be provided
+  if (!payload.resolutionProofImages || payload.resolutionProofImages.length === 0) {
+    return res.status(400).json({ message: "At least one proof image is required to resolve an issue" });
+  }
+
+  // Validate that all proof images are valid URLs
+  for (const imageUrl of payload.resolutionProofImages) {
+    try {
+      new URL(imageUrl);
+    } catch (_) {
+      return res.status(400).json({ message: "Invalid proof image URL provided" });
+    }
+  }
+
+  // Only admins can add resolution proof images
+  const updated = await prisma.problem.update({
+    where: { id },
+    data: {
+      status: "RESOLVED",
+      resolutionProofImages: payload.resolutionProofImages,
+      resolvedAt: new Date(),
+    },
+  });
+
+  await logAuditEvent({
+    actor: req.user,
+    action: AuditAction.ISSUE_RESOLVED,
+    entityType: "PROBLEM",
+    entityId: updated.id,
+    summary: `${req.user.mobile || "Unknown admin"} resolved issue ${updated.id} with ${payload.resolutionProofImages.length} proof image(s)`,
+  });
+
+  return res.json(updated);
+}
